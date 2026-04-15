@@ -22,7 +22,9 @@
 #include <ndn-cxx/security/signing-helpers.hpp>
 #include <ndn-cxx/security/verification-helpers.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #ifdef NDN_SVS_COMPRESSION
 #include <boost/iostreams/copy.hpp>
@@ -44,11 +46,14 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_id(nid)
   , m_onUpdate(onUpdate)
   , m_maxSuppressionTime(500_ms)
-  , m_periodicSyncTime(30_s)
+  , m_minPeriodicSyncTime(1_s)
+  , m_maxPeriodicSyncTime(30_s)
+  , m_periodicSyncTime(m_maxPeriodicSyncTime)
   , m_periodicSyncJitter(0.1)
+  , m_recentStateVectorEntries(8)
+  , m_maxStateVectorEntries(32)
+  , m_stateVectorCursor(0)
   , m_rng(ndn::random::getRandomNumberEngine())
-  , m_retxDist(m_periodicSyncTime.count() * (1.0 - m_periodicSyncJitter),
-               m_periodicSyncTime.count() * (1.0 + m_periodicSyncJitter))
   , m_intrReplyDist(0, m_maxSuppressionTime.count())
   , m_keyChainMem("pib-memory:", "tpm-memory:")
   , m_scheduler(m_face.getIoContext())
@@ -86,6 +91,63 @@ SVSyncCore::sendInitialInterest()
     m_initialized = true;
     retxSyncInterest(true, 0);
   });
+}
+
+size_t
+SVSyncCore::getStateVectorLimit(size_t totalEntries) const
+{
+  if (totalEntries == 0)
+    return 0;
+
+  auto scaled = static_cast<size_t>(std::ceil(2.0 * std::sqrt(static_cast<double>(totalEntries))));
+  scaled = std::max(m_recentStateVectorEntries, scaled);
+  scaled = std::min(m_maxStateVectorEntries, scaled);
+  return std::min(totalEntries, scaled);
+}
+
+VersionVector
+SVSyncCore::buildSyncVector()
+{
+  std::lock_guard<std::mutex> lock(m_vvMutex);
+
+  const size_t totalEntries = m_vv.size();
+  const size_t limit = getStateVectorLimit(totalEntries);
+  if (limit >= totalEntries)
+    return m_vv;
+
+  VersionVector partial = m_vv.selectSubset(limit, m_recentStateVectorEntries, m_stateVectorCursor, m_id);
+  if (totalEntries > 0)
+    m_stateVectorCursor = (m_stateVectorCursor + limit) % totalEntries;
+  return partial;
+}
+
+void
+SVSyncCore::updateSyncInterval(bool hasActivity)
+{
+  auto current = static_cast<long>(m_periodicSyncTime.count());
+  long next = current;
+
+  if (hasActivity) {
+    next = std::max<long>(m_minPeriodicSyncTime.count(),
+                          static_cast<long>(std::llround(current * 0.75)));
+  }
+  else {
+    long step = std::max<long>(250, current / 6);
+    next = std::min<long>(m_maxPeriodicSyncTime.count(), current + step);
+  }
+
+  m_periodicSyncTime = time::milliseconds(next);
+}
+
+unsigned int
+SVSyncCore::sampleSyncDelay()
+{
+  auto base = std::max<long>(1, m_periodicSyncTime.count());
+  auto low = std::max<long>(1, static_cast<long>(std::llround(base * (1.0 - m_periodicSyncJitter))));
+  auto high = std::max<long>(low, static_cast<long>(std::llround(base * (1.0 + m_periodicSyncJitter))));
+
+  std::uniform_int_distribution<long> dist(low, high);
+  return static_cast<unsigned int>(dist(m_rng));
 }
 
 void
@@ -180,6 +242,7 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
 
   // Merge state vector
   auto result = mergeStateVector(*vvOther);
+  updateSyncInterval(result.myVectorNew || result.otherVectorNew || !result.missingInfo.empty());
 
   // Callback if missing data found
   if (!result.missingInfo.empty()) {
@@ -226,7 +289,7 @@ SVSyncCore::retxSyncInterest(bool send, unsigned int delay)
   }
 
   if (delay == 0)
-    delay = m_retxDist(m_rng);
+    delay = sampleSyncDelay();
 
   {
     std::lock_guard<std::mutex> lock(m_schedulerMutex);
@@ -246,16 +309,16 @@ SVSyncCore::sendSyncInterest()
 
   // Build app parameters
   ndn::encoding::EncodingBuffer enc;
+  VersionVector syncVv = buildSyncVector();
   {
-    std::lock_guard<std::mutex> lock(m_vvMutex);
     size_t length = 0;
 
     // Add extra mapping blocks
     if (m_getExtraBlock)
-      length += ndn::encoding::prependBlock(enc, m_getExtraBlock(m_vv));
+      length += ndn::encoding::prependBlock(enc, m_getExtraBlock(syncVv));
 
-    // Add state vector
-    length += ndn::encoding::prependBlock(enc, m_vv.encode());
+    // Add a compact state vector slice
+    length += ndn::encoding::prependBlock(enc, syncVv.encode());
 
     // Add length and ApplicationParameters type
     enc.prependVarNumber(length);
@@ -362,8 +425,10 @@ SVSyncCore::updateSeqNo(const SeqNo& seq, const NodeID& nid)
     m_vv.set(t_nid, seq);
   }
 
-  if (seq > prev)
+  if (seq > prev) {
+    updateSyncInterval(true);
     retxSyncInterest(false, 1);
+  }
 }
 
 std::set<NodeID>

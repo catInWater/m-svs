@@ -17,6 +17,9 @@
 #include "version-vector.hpp"
 #include "tlv.hpp"
 
+#include <algorithm>
+#include <vector>
+
 namespace ndn::svs {
 
 VersionVector::VersionVector(const ndn::Block& block)
@@ -59,6 +62,66 @@ VersionVector::encode() const
   enc.prependVarNumber(totalLength);
   enc.prependVarNumber(tlv::StateVector);
   return enc.block();
+}
+
+VersionVector
+VersionVector::selectSubset(size_t maxEntries,
+                            size_t recentEntries,
+                            size_t startIndex,
+                            const NodeID& preferredNode) const
+{
+  VersionVector selected;
+
+  if (maxEntries == 0 || m_map.empty())
+    return selected;
+
+  if (m_map.size() <= maxEntries)
+    return *this;
+
+  auto addEntry = [this, &selected](const NodeID& nid) {
+    auto it = m_map.find(nid);
+    if (it == m_map.end() || selected.m_map.find(nid) != selected.m_map.end())
+      return false;
+
+    selected.m_map.emplace(it->first, it->second);
+
+    auto lastUpdate = m_lastUpdate.find(nid);
+    selected.m_lastUpdate[nid] =
+      lastUpdate == m_lastUpdate.end() ? time::system_clock::time_point::min() : lastUpdate->second;
+    return true;
+  };
+
+  if (!preferredNode.empty())
+    addEntry(preferredNode);
+
+  std::vector<NodeID> orderedNodes;
+  orderedNodes.reserve(m_map.size());
+  for (const auto& entry : m_map)
+    orderedNodes.push_back(entry.first);
+
+  if (recentEntries > 0) {
+    auto recentNodes = orderedNodes;
+    std::sort(recentNodes.begin(), recentNodes.end(), [this](const NodeID& lhs, const NodeID& rhs) {
+      auto lhsTs = getLastUpdate(lhs);
+      auto rhsTs = getLastUpdate(rhs);
+      if (lhsTs == rhsTs)
+        return lhs < rhs;
+      return lhsTs > rhsTs;
+    });
+
+    for (const auto& nid : recentNodes) {
+      if (selected.m_map.size() >= maxEntries || recentEntries == 0)
+        break;
+      if (addEntry(nid))
+        --recentEntries;
+    }
+  }
+
+  size_t offset = startIndex % orderedNodes.size();
+  for (size_t i = 0; i < orderedNodes.size() && selected.m_map.size() < maxEntries; ++i)
+    addEntry(orderedNodes[(offset + i) % orderedNodes.size()]);
+
+  return selected;
 }
 
 std::string

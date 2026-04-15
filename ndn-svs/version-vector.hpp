@@ -19,6 +19,7 @@
 
 #include "common.hpp"
 
+#include <cstddef>
 #include <map>
 
 namespace ndn::svs {
@@ -42,8 +43,25 @@ public:
   /** Encode the version vector to a string */
   ndn::Block encode() const;
 
+  /**
+   * @brief Select a compact subset of the vector.
+   *
+   * The selection algorithm always prefers the supplied node, then the most
+   * recently updated entries, and finally fills the remaining budget in a
+   * round-robin order to guarantee eventual coverage.
+   */
+  VersionVector selectSubset(size_t maxEntries,
+                             size_t recentEntries = 0,
+                             size_t startIndex = 0,
+                             const NodeID& preferredNode = NodeID()) const;
+
   /** Get a human-readable representation */
   std::string toStr() const;
+
+  size_t size() const noexcept
+  {
+    return m_map.size();
+  }
 
   SeqNo set(const NodeID& nid, SeqNo seqNo)
   {

@@ -226,6 +226,12 @@ public:
   static inline const NodeID EMPTY_NODE_ID;
 
 private:
+  size_t getStateVectorLimit(size_t totalEntries) const;
+  VersionVector buildSyncVector();
+  void updateSyncInterval(bool hasActivity);
+  unsigned int sampleSyncDelay();
+
+private:
   // Communication
   ndn::Face& m_face;
   const Name m_syncPrefix;
@@ -249,17 +255,23 @@ private:
   // Max suppression time; this value is roughly
   // positively correlated to the network diameter
   time::milliseconds m_maxSuppressionTime;
-  // Periodic timer value; can be set to lower
-  // for highly lossy networks.
+  // Lower and upper bounds for the adaptive periodic sync timer.
+  time::milliseconds m_minPeriodicSyncTime;
+  time::milliseconds m_maxPeriodicSyncTime;
+  // Current adaptive timer value.
   time::milliseconds m_periodicSyncTime;
   // Fraction of jitter in the periodic timer value.
   // Positively correlated to network diameter.
   double m_periodicSyncJitter;
+  // Number of recently updated entries that are always prioritized.
+  size_t m_recentStateVectorEntries;
+  // Hard cap for the number of state vector entries per sync interest.
+  size_t m_maxStateVectorEntries;
+  // Round-robin cursor through the state vector to guarantee coverage.
+  size_t m_stateVectorCursor;
 
   // Random Engine
   ndn::random::RandomNumberEngine& m_rng;
-  // Milliseconds between sending two sync interests
-  std::uniform_int_distribution<> m_retxDist;
   // Milliseconds to send sync interest reply after
   std::uniform_int_distribution<> m_intrReplyDist;
 

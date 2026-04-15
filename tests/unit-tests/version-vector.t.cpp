@@ -101,6 +101,23 @@ BOOST_AUTO_TEST_CASE(Ordering)
   BOOST_CHECK_EQUAL(v1str, v2str);
 }
 
+BOOST_AUTO_TEST_CASE(SelectSubsetKeepsPreferredAndRecentEntries)
+{
+  VersionVector vv;
+  vv.set("/node/one", 1);
+  vv.set("/node/two", 2);
+  vv.set("/node/three", 3);
+  vv.set("/node/four", 4);
+
+  VersionVector subset = vv.selectSubset(2, 1, 0, "/node/two");
+
+  BOOST_CHECK_EQUAL(subset.size(), 2);
+  BOOST_CHECK(subset.has("/node/two"));
+  BOOST_CHECK(subset.has("/node/four"));
+  BOOST_CHECK_EQUAL(subset.get("/node/two"), 2);
+  BOOST_CHECK_EQUAL(subset.get("/node/four"), 4);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
