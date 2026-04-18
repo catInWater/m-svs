@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 
 #ifdef NDN_SVS_COMPRESSION
 #include <boost/iostreams/copy.hpp>
@@ -34,6 +36,116 @@
 #endif
 
 namespace ndn::svs {
+namespace {
+
+std::string
+getEnvOrDefault(const char* name, const std::string& defaultValue)
+{
+  const char* value = std::getenv(name);
+  return value == nullptr ? defaultValue : std::string(value);
+}
+
+size_t
+getEnvSize(const char* name, size_t defaultValue)
+{
+  const char* value = std::getenv(name);
+  if (value == nullptr)
+    return defaultValue;
+
+  try {
+    return static_cast<size_t>(std::stoul(value));
+  }
+  catch (const std::exception&) {
+    return defaultValue;
+  }
+}
+
+double
+getEnvDouble(const char* name, double defaultValue)
+{
+  const char* value = std::getenv(name);
+  if (value == nullptr)
+    return defaultValue;
+
+  try {
+    return std::stod(value);
+  }
+  catch (const std::exception&) {
+    return defaultValue;
+  }
+}
+
+bool
+getEnvBool(const char* name, bool defaultValue)
+{
+  auto value = getEnvOrDefault(name, defaultValue ? "1" : "0");
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+  return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+VersionVector::SubsetStrategy
+parseSubsetStrategy(const std::string& strategy)
+{
+  std::string value = strategy;
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+
+  if (value == "full" || value == "baseline")
+    return VersionVector::SubsetStrategy::Full;
+  if (value == "roundrobin" || value == "round-robin" || value == "rotation")
+    return VersionVector::SubsetStrategy::RoundRobin;
+  if (value == "recent" || value == "latest")
+    return VersionVector::SubsetStrategy::Recent;
+  if (value == "random")
+    return VersionVector::SubsetStrategy::Random;
+  return VersionVector::SubsetStrategy::Hybrid;
+}
+
+TimerMode
+parseTimerMode(const std::string& mode)
+{
+  std::string value = mode;
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+
+  if (value == "fixed" || value == "static")
+    return TimerMode::Fixed;
+  if (value == "aware" || value == "network-aware" || value == "network" || value == "coord")
+    return TimerMode::NetworkAware;
+  return TimerMode::Adaptive;
+}
+
+const char*
+toString(VersionVector::SubsetStrategy strategy)
+{
+  switch (strategy) {
+    case VersionVector::SubsetStrategy::Full:
+      return "full";
+    case VersionVector::SubsetStrategy::RoundRobin:
+      return "round-robin";
+    case VersionVector::SubsetStrategy::Recent:
+      return "recent";
+    case VersionVector::SubsetStrategy::Random:
+      return "random";
+    case VersionVector::SubsetStrategy::Hybrid:
+    default:
+      return "hybrid";
+  }
+}
+
+const char*
+toString(TimerMode mode)
+{
+  switch (mode) {
+    case TimerMode::Fixed:
+      return "fixed";
+    case TimerMode::NetworkAware:
+      return "network-aware";
+    case TimerMode::Adaptive:
+    default:
+      return "adaptive";
+  }
+}
+
+} // namespace
 
 SVSyncCore::SVSyncCore(ndn::Face& face,
                        const Name& syncPrefix,
@@ -48,16 +160,70 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_maxSuppressionTime(500_ms)
   , m_minPeriodicSyncTime(1_s)
   , m_maxPeriodicSyncTime(30_s)
-  , m_periodicSyncTime(m_maxPeriodicSyncTime)
-  , m_periodicSyncJitter(0.1)
-  , m_recentStateVectorEntries(8)
-  , m_maxStateVectorEntries(32)
+  , m_periodicSyncTime(time::milliseconds(getEnvSize("NDN_SVS_FIXED_INTERVAL_MS", 30000)))
+  , m_periodicSyncJitter(getEnvDouble("NDN_SVS_TIMER_JITTER", 0.1))
+  , m_recentStateVectorEntries(getEnvSize("NDN_SVS_RECENT_ENTRIES", 8))
+  , m_maxStateVectorEntries(getEnvSize("NDN_SVS_MAX_STATE_VECTOR_ENTRIES", 32))
+  , m_stateVectorRatio(getEnvDouble("NDN_SVS_STATE_VECTOR_RATIO", 0.0))
+  , m_stateVectorStrategy(parseSubsetStrategy(getEnvOrDefault("NDN_SVS_VECTOR_STRATEGY", "hybrid")))
+  , m_hybridHotRatio(getEnvDouble("NDN_SVS_HYBRID_HOT_RATIO", 0.75))
+  , m_hybridMinFairEntries(getEnvSize("NDN_SVS_HYBRID_MIN_FAIR_ENTRIES", 2))
+  , m_networkDiameterMs(getEnvDouble("NDN_SVS_NETWORK_DIAMETER_MS", 120.0))
+  , m_networkDiameterHops(getEnvSize("NDN_SVS_NETWORK_DIAMETER_HOPS", 4))
+  , m_linkLossRate(std::clamp(getEnvDouble("NDN_SVS_LINK_LOSS_PCT", 0.0) / 100.0, 0.0, 0.95))
+  , m_expectedHotspotRatio(std::clamp(getEnvDouble("NDN_SVS_HOT_NODE_RATIO", 0.0), 0.0, 1.0))
+  , m_enableCoordinatedSync(getEnvBool("NDN_SVS_COORDINATED_SYNC", true))
+  , m_timerMode(parseTimerMode(getEnvOrDefault("NDN_SVS_TIMER_MODE", "network-aware")))
+  , m_enableMetricsLog(getEnvBool("NDN_SVS_LOG_METRICS", false))
   , m_stateVectorCursor(0)
+  , m_minSendInterval(time::milliseconds(getEnvSize("NDN_SVS_MIN_SEND_INTERVAL_MS", 0)))
+  , m_localUpdateDelay(time::milliseconds(getEnvSize("NDN_SVS_LOCAL_UPDATE_DELAY_MS", 1)))
   , m_rng(ndn::random::getRandomNumberEngine())
   , m_intrReplyDist(0, m_maxSuppressionTime.count())
   , m_keyChainMem("pib-memory:", "tpm-memory:")
   , m_scheduler(m_face.getIoContext())
 {
+  if (m_timerMode == TimerMode::NetworkAware) {
+    const double diameterMs = std::max(20.0, m_networkDiameterMs);
+    auto suppressionMs = static_cast<long>(std::llround(diameterMs * (1.2 + 1.6 * m_linkLossRate)
+                                                        + static_cast<double>(m_networkDiameterHops) * 8.0));
+    suppressionMs = std::clamp<long>(suppressionMs, 40, 1200);
+    m_maxSuppressionTime = time::milliseconds(suppressionMs);
+    m_intrReplyDist = std::uniform_int_distribution<>(0, m_maxSuppressionTime.count());
+
+    auto awareMin = static_cast<long>(std::llround(diameterMs * (3.5 + 2.5 * m_linkLossRate)
+                                                   + static_cast<double>(m_networkDiameterHops) * 30.0));
+    awareMin = std::clamp<long>(awareMin, 300, 5000);
+    m_minPeriodicSyncTime = time::milliseconds(awareMin);
+    auto initialPeriod = std::clamp<long>(static_cast<long>(std::llround(awareMin * (2.0 + 0.8 * m_linkLossRate))),
+                                          awareMin,
+                                          m_maxPeriodicSyncTime.count());
+    m_periodicSyncTime = time::milliseconds(std::min<long>(m_periodicSyncTime.count(), initialPeriod));
+  }
+
+  if (m_periodicSyncTime < m_minPeriodicSyncTime)
+    m_periodicSyncTime = m_minPeriodicSyncTime;
+  if (m_periodicSyncTime > m_maxPeriodicSyncTime)
+    m_periodicSyncTime = m_maxPeriodicSyncTime;
+
+  if (m_enableMetricsLog) {
+    std::cout << "SVS_CONFIG node=" << m_id
+              << " strategy=" << toString(m_stateVectorStrategy)
+              << " timer=" << toString(m_timerMode)
+              << " ratio=" << m_stateVectorRatio
+              << " max_entries=" << m_maxStateVectorEntries
+              << " hybrid_hot_ratio=" << m_hybridHotRatio
+              << " hybrid_min_fair=" << m_hybridMinFairEntries
+              << " diameter_ms=" << m_networkDiameterMs
+              << " diameter_hops=" << m_networkDiameterHops
+              << " loss_rate=" << m_linkLossRate
+              << " hot_ratio=" << m_expectedHotspotRatio
+              << " coordinated=" << (m_enableCoordinatedSync ? 1 : 0)
+              << " min_gap_ms=" << m_minSendInterval.count()
+              << " local_batch_ms=" << m_localUpdateDelay.count()
+              << std::endl;
+  }
+
   // Register sync interest filter
   m_syncRegisteredPrefix =
     m_face.setInterestFilter(syncPrefix,
@@ -99,8 +265,33 @@ SVSyncCore::getStateVectorLimit(size_t totalEntries) const
   if (totalEntries == 0)
     return 0;
 
-  auto scaled = static_cast<size_t>(std::ceil(2.0 * std::sqrt(static_cast<double>(totalEntries))));
-  scaled = std::max(m_recentStateVectorEntries, scaled);
+  if (m_stateVectorStrategy == VersionVector::SubsetStrategy::Full)
+    return totalEntries;
+
+  size_t scaled = 0;
+  if (m_stateVectorRatio > 0.0) {
+    scaled = static_cast<size_t>(std::ceil(static_cast<double>(totalEntries) * m_stateVectorRatio));
+  }
+  else {
+    scaled = static_cast<size_t>(std::ceil(2.0 * std::sqrt(static_cast<double>(totalEntries))));
+    scaled = std::max(m_recentStateVectorEntries, scaled);
+  }
+
+  scaled = std::max<size_t>(1, scaled);
+
+  if (m_enableCoordinatedSync) {
+    const double topologyPressure = std::min(1.0, m_networkDiameterMs / 250.0);
+    const double hotness = std::clamp(0.6 * m_hotspotScore + 0.4 * m_expectedHotspotRatio, 0.0, 1.0);
+    const double pressure = std::clamp(0.55 * m_linkLossRate + 0.25 * topologyPressure + 0.35 * hotness,
+                                       0.0,
+                                       1.0);
+    const size_t floorEntries = std::min(totalEntries,
+                                         std::max<size_t>(m_recentStateVectorEntries + m_hybridMinFairEntries,
+                                                          std::min<size_t>(m_maxStateVectorEntries, 8)));
+    scaled = std::max(scaled, floorEntries);
+    scaled = static_cast<size_t>(std::ceil(static_cast<double>(scaled) * (1.0 + 0.22 * pressure)));
+  }
+
   scaled = std::min(m_maxStateVectorEntries, scaled);
   return std::min(totalEntries, scaled);
 }
@@ -112,29 +303,157 @@ SVSyncCore::buildSyncVector()
 
   const size_t totalEntries = m_vv.size();
   const size_t limit = getStateVectorLimit(totalEntries);
-  if (limit >= totalEntries)
+  if (limit >= totalEntries || m_stateVectorStrategy == VersionVector::SubsetStrategy::Full)
     return m_vv;
 
-  VersionVector partial = m_vv.selectSubset(limit, m_recentStateVectorEntries, m_stateVectorCursor, m_id);
-  if (totalEntries > 0)
+  size_t selector = m_stateVectorCursor;
+  if (m_stateVectorStrategy == VersionVector::SubsetStrategy::Random)
+    selector = static_cast<size_t>(m_rng());
+
+  double effectiveHotRatio = m_hybridHotRatio;
+  size_t effectiveFairEntries = m_hybridMinFairEntries;
+  if (m_enableCoordinatedSync && m_stateVectorStrategy == VersionVector::SubsetStrategy::Hybrid) {
+    const double topologyPressure = std::min(1.0, m_networkDiameterMs / 250.0);
+    const double hotness = std::clamp(0.6 * m_hotspotScore + 0.25 * m_activityScore + 0.15 * m_expectedHotspotRatio,
+                                      0.0,
+                                      1.0);
+    effectiveHotRatio = std::clamp(m_hybridHotRatio + 0.12 * hotness + 0.08 * m_linkLossRate - 0.03 * topologyPressure,
+                                   0.55,
+                                   0.92);
+    if (hotness < 0.35)
+      effectiveFairEntries = std::min<size_t>(std::max<size_t>(1, m_hybridMinFairEntries + 1), std::max<size_t>(1, limit / 3));
+  }
+
+  VersionVector partial = m_vv.selectSubset(limit,
+                                            m_recentStateVectorEntries,
+                                            selector,
+                                            m_id,
+                                            m_stateVectorStrategy,
+                                            effectiveHotRatio,
+                                            effectiveFairEntries);
+  if (totalEntries > 0 && m_stateVectorStrategy != VersionVector::SubsetStrategy::Random)
     m_stateVectorCursor = (m_stateVectorCursor + limit) % totalEntries;
   return partial;
 }
 
 void
-SVSyncCore::updateSyncInterval(bool hasActivity)
+SVSyncCore::updateSyncInterval(SyncSignal signal)
 {
-  auto current = static_cast<long>(m_periodicSyncTime.count());
-  long next = current;
+  if (m_timerMode == TimerMode::Fixed)
+    return;
 
-  if (hasActivity) {
-    next = std::max<long>(m_minPeriodicSyncTime.count(),
-                          static_cast<long>(std::llround(current * 0.75)));
+  const long nowUs = getCurrentTime();
+  const long current = static_cast<long>(m_periodicSyncTime.count());
+  long floorMs = static_cast<long>(m_minPeriodicSyncTime.count());
+
+  {
+    std::lock_guard<std::mutex> lock(m_vvMutex);
+    const auto totalEntries = static_cast<long>(m_vv.size());
+    if (m_stateVectorStrategy == VersionVector::SubsetStrategy::Full) {
+      floorMs = std::max<long>(floorMs, 1400 + totalEntries * 18);
+    }
+    else if (totalEntries > 0) {
+      floorMs = std::max<long>(floorMs, 650 + std::min<long>(totalEntries, 64) * 9);
+    }
   }
-  else {
-    long step = std::max<long>(250, current / 6);
-    next = std::min<long>(m_maxPeriodicSyncTime.count(), current + step);
+
+  if (m_lastTimerAdjustUs != 0 && (nowUs - m_lastTimerAdjustUs) < 220000) {
+    if (signal == SyncSignal::RepairNeeded && current > floorMs) {
+      long nudged = floorMs + std::max<long>(0, (current - floorMs) / 2);
+      m_periodicSyncTime = time::milliseconds(nudged);
+    }
+    return;
   }
+  m_lastTimerAdjustUs = nowUs;
+
+  if (m_timerMode == TimerMode::Adaptive) {
+    long next = current;
+    switch (signal) {
+      case SyncSignal::LocalUpdate:
+        m_activityScore = std::min(1.0, m_activityScore * 0.85 + 0.18);
+        next = std::max<long>(floorMs, current - std::max<long>(200, current / 8));
+        break;
+
+      case SyncSignal::RepairNeeded:
+        m_activityScore = std::min(1.0, m_activityScore * 0.75 + 0.30);
+        next = std::max<long>(floorMs, current - std::max<long>(350, current / 4));
+        break;
+
+      case SyncSignal::RemoteUpdate:
+        m_activityScore = std::min(1.0, m_activityScore * 0.80 + 0.08);
+        next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(100, current / 16));
+        break;
+
+      case SyncSignal::Idle:
+      default:
+        m_activityScore *= 0.65;
+        next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(400, current / 5));
+        break;
+    }
+
+    const long weightedFloor = floorMs + static_cast<long>(std::llround(m_activityScore * 250.0));
+    next = std::max<long>(weightedFloor, next);
+    next = std::min<long>(m_maxPeriodicSyncTime.count(), std::max<long>(m_minPeriodicSyncTime.count(), next));
+    m_periodicSyncTime = time::milliseconds(next);
+    return;
+  }
+
+  const double topologyPressure = std::min(1.0, m_networkDiameterMs / 250.0);
+  const double coordinationGain = (m_enableCoordinatedSync && m_stateVectorStrategy != VersionVector::SubsetStrategy::Full)
+                                    ? 0.88
+                                    : 1.0;
+  const long networkFloor = std::max<long>(
+    floorMs,
+    static_cast<long>(std::llround((m_networkDiameterMs * (3.0 + 2.2 * m_linkLossRate)
+                                    + static_cast<double>(m_networkDiameterHops) * 24.0
+                                    + 180.0)
+                                   * coordinationGain)));
+
+  long next = current;
+  switch (signal) {
+    case SyncSignal::LocalUpdate:
+      m_activityScore = std::min(1.0, m_activityScore * 0.72 + 0.25);
+      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.65 + 0.35);
+      {
+        const double hotnessNow = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
+                                             0.0,
+                                             1.0);
+        const long divisor = (m_enableCoordinatedSync && m_stateVectorStrategy != VersionVector::SubsetStrategy::Full)
+                               ? (hotnessNow > 0.72 ? 4 : 5)
+                               : (hotnessNow > 0.72 ? 6 : 7);
+        next = std::max<long>(networkFloor,
+                              current - std::max<long>(120, current / divisor));
+      }
+      break;
+
+    case SyncSignal::RepairNeeded:
+      m_activityScore = std::min(1.0, m_activityScore * 0.75 + 0.22);
+      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.82 + 0.12);
+      next = std::max<long>(networkFloor, current - std::max<long>(220, current / 4));
+      break;
+
+    case SyncSignal::RemoteUpdate:
+      m_activityScore = std::min(1.0, m_activityScore * 0.80 + 0.06);
+      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.90 + 0.03);
+      next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(130, current / 10));
+      break;
+
+    case SyncSignal::Idle:
+    default:
+      m_activityScore *= 0.60;
+      m_hotspotScore *= 0.55;
+      next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(420, current / 3));
+      break;
+  }
+
+  const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
+                                    0.0,
+                                    1.0);
+  const long hotFloor = static_cast<long>(std::llround(networkFloor * (1.0 - 0.22 * hotness * (1.05 - coordinationGain))));
+  const long lossBuffer = static_cast<long>(std::llround(120.0 * m_linkLossRate + 80.0 * topologyPressure));
+
+  next = std::max<long>(std::max<long>(m_minPeriodicSyncTime.count(), hotFloor), next);
+  next = std::min<long>(m_maxPeriodicSyncTime.count(), next + lossBuffer / 4);
 
   m_periodicSyncTime = time::milliseconds(next);
 }
@@ -143,8 +462,14 @@ unsigned int
 SVSyncCore::sampleSyncDelay()
 {
   auto base = std::max<long>(1, m_periodicSyncTime.count());
+  double extraSpread = 0.0;
+  if (m_timerMode == TimerMode::NetworkAware) {
+    extraSpread = 0.10 * m_linkLossRate + 0.08 * m_hotspotScore + 0.05 * std::min(1.0, m_networkDiameterMs / 250.0);
+  }
+
   auto low = std::max<long>(1, static_cast<long>(std::llround(base * (1.0 - m_periodicSyncJitter))));
-  auto high = std::max<long>(low, static_cast<long>(std::llround(base * (1.0 + m_periodicSyncJitter))));
+  auto high = std::max<long>(low,
+                             static_cast<long>(std::llround(base * (1.0 + m_periodicSyncJitter + extraSpread))));
 
   std::uniform_int_distribution<long> dist(low, high);
   return static_cast<unsigned int>(dist(m_rng));
@@ -242,7 +567,13 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
 
   // Merge state vector
   auto result = mergeStateVector(*vvOther);
-  updateSyncInterval(result.myVectorNew || result.otherVectorNew || !result.missingInfo.empty());
+
+  SyncSignal signal = SyncSignal::Idle;
+  if (!result.missingInfo.empty())
+    signal = SyncSignal::RepairNeeded;
+  else if (result.myVectorNew || result.otherVectorNew)
+    signal = SyncSignal::RemoteUpdate;
+  updateSyncInterval(signal);
 
   // Callback if missing data found
   if (!result.missingInfo.empty()) {
@@ -279,13 +610,28 @@ void
 SVSyncCore::retxSyncInterest(bool send, unsigned int delay)
 {
   if (send) {
-    std::lock_guard<std::mutex> lock(m_recordedVvMutex);
+    long minGapUs = m_minSendInterval.count() * 1000;
+    const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
+                                      0.0,
+                                      1.0);
+    if (minGapUs > 0 && m_enableCoordinatedSync && hotness > 0.72)
+      minGapUs = std::max<long>(8000, minGapUs / 2);
 
-    // Only send interest if in steady state or local vector has newer state
-    // than recorded interests
-    if (!m_recordedVv || mergeStateVector(*m_recordedVv).myVectorNew)
-      sendSyncInterest();
-    m_recordedVv = nullptr;
+    const long lastTxUs = m_lastSyncTxUs.load();
+    const long nowUs = getCurrentTime();
+    if (minGapUs > 0 && lastTxUs > 0 && nowUs < lastTxUs + minGapUs) {
+      delay = static_cast<unsigned int>(std::max<long>(1, (lastTxUs + minGapUs - nowUs + 999) / 1000));
+      send = false;
+    }
+    else {
+      std::lock_guard<std::mutex> lock(m_recordedVvMutex);
+
+      // Only send interest if in steady state or local vector has newer state
+      // than recorded interests
+      if (!m_recordedVv || mergeStateVector(*m_recordedVv).myVectorNew)
+        sendSyncInterest();
+      m_recordedVv = nullptr;
+    }
   }
 
   if (delay == 0)
@@ -338,6 +684,18 @@ SVSyncCore::sendSyncInterest()
   wire.encode();
 #endif
 
+  if (m_enableMetricsLog) {
+    std::cout << "SVS_TX_METRIC ts=" << getCurrentTime()
+              << " node=" << m_id
+              << " strategy=" << toString(m_stateVectorStrategy)
+              << " timer=" << toString(m_timerMode)
+              << " period_ms=" << m_periodicSyncTime.count()
+              << " hot_score=" << (0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio)
+              << " entries=" << syncVv.size()
+              << " bytes=" << wire.size()
+              << std::endl;
+  }
+
   // Create Sync Interest
   Interest interest(Name(m_syncPrefix).appendVersion(2));
   interest.setApplicationParameters(wire);
@@ -356,6 +714,7 @@ SVSyncCore::sendSyncInterest()
       break;
   }
 
+  m_lastSyncTxUs = getCurrentTime();
   m_face.expressInterest(interest, nullptr, nullptr, nullptr);
 }
 
@@ -426,8 +785,14 @@ SVSyncCore::updateSeqNo(const SeqNo& seq, const NodeID& nid)
   }
 
   if (seq > prev) {
-    updateSyncInterval(true);
-    retxSyncInterest(false, 1);
+    updateSyncInterval(SyncSignal::LocalUpdate);
+    long localDelay = std::max<long>(1, m_localUpdateDelay.count());
+    const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
+                                      0.0,
+                                      1.0);
+    if (m_enableCoordinatedSync && hotness > 0.72)
+      localDelay = std::max<long>(1, localDelay / 2);
+    retxSyncInterest(false, static_cast<unsigned int>(localDelay));
   }
 }
 

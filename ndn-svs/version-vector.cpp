@@ -18,6 +18,7 @@
 #include "tlv.hpp"
 
 #include <algorithm>
+#include <random>
 #include <vector>
 
 namespace ndn::svs {
@@ -68,14 +69,17 @@ VersionVector
 VersionVector::selectSubset(size_t maxEntries,
                             size_t recentEntries,
                             size_t startIndex,
-                            const NodeID& preferredNode) const
+                            const NodeID& preferredNode,
+                            SubsetStrategy strategy,
+                            double hotRatio,
+                            size_t minFairEntries) const
 {
   VersionVector selected;
 
   if (maxEntries == 0 || m_map.empty())
     return selected;
 
-  if (m_map.size() <= maxEntries)
+  if (strategy == SubsetStrategy::Full || m_map.size() <= maxEntries)
     return *this;
 
   auto addEntry = [this, &selected](const NodeID& nid) {
@@ -99,7 +103,10 @@ VersionVector::selectSubset(size_t maxEntries,
   for (const auto& entry : m_map)
     orderedNodes.push_back(entry.first);
 
-  if (recentEntries > 0) {
+  auto addRecentEntries = [&](size_t budget) {
+    if (budget == 0)
+      return;
+
     auto recentNodes = orderedNodes;
     std::sort(recentNodes.begin(), recentNodes.end(), [this](const NodeID& lhs, const NodeID& rhs) {
       auto lhsTs = getLastUpdate(lhs);
@@ -110,16 +117,75 @@ VersionVector::selectSubset(size_t maxEntries,
     });
 
     for (const auto& nid : recentNodes) {
-      if (selected.m_map.size() >= maxEntries || recentEntries == 0)
+      if (selected.m_map.size() >= maxEntries || budget == 0)
         break;
       if (addEntry(nid))
-        --recentEntries;
+        --budget;
     }
-  }
+  };
 
-  size_t offset = startIndex % orderedNodes.size();
-  for (size_t i = 0; i < orderedNodes.size() && selected.m_map.size() < maxEntries; ++i)
-    addEntry(orderedNodes[(offset + i) % orderedNodes.size()]);
+  auto addRoundRobinEntries = [&](size_t budget) {
+    if (budget == 0 || orderedNodes.empty())
+      return;
+
+    size_t offset = startIndex % orderedNodes.size();
+    for (size_t i = 0; i < orderedNodes.size() && selected.m_map.size() < maxEntries && budget > 0; ++i) {
+      if (addEntry(orderedNodes[(offset + i) % orderedNodes.size()]))
+        --budget;
+    }
+  };
+
+  switch (strategy) {
+    case SubsetStrategy::Recent:
+      addRecentEntries(maxEntries);
+      break;
+
+    case SubsetStrategy::Random: {
+      std::minstd_rand rng(static_cast<uint32_t>(startIndex));
+      std::shuffle(orderedNodes.begin(), orderedNodes.end(), rng);
+      for (const auto& nid : orderedNodes) {
+        if (selected.m_map.size() >= maxEntries)
+          break;
+        addEntry(nid);
+      }
+      break;
+    }
+
+    case SubsetStrategy::RoundRobin:
+      addRoundRobinEntries(maxEntries);
+      break;
+
+    case SubsetStrategy::Hybrid: {
+      const double boundedHotRatio = std::clamp(hotRatio, 0.50, 0.95);
+      const size_t fairnessReserve = maxEntries >= 4
+                                       ? std::min(maxEntries - 1, std::max<size_t>(1, minFairEntries))
+                                       : 0;
+      size_t hotTarget = static_cast<size_t>(std::ceil(static_cast<double>(maxEntries) * boundedHotRatio));
+      if (hotTarget + fairnessReserve > maxEntries)
+        hotTarget = maxEntries - fairnessReserve;
+      hotTarget = std::max(hotTarget, selected.m_map.size());
+      hotTarget = std::max(hotTarget,
+                           std::min(maxEntries, selected.m_map.size() + std::max<size_t>(1, recentEntries)));
+
+      if (hotTarget > selected.m_map.size())
+        addRecentEntries(hotTarget - selected.m_map.size());
+
+      if (fairnessReserve > 0 && selected.m_map.size() < maxEntries)
+        addRoundRobinEntries(std::min(fairnessReserve, maxEntries - selected.m_map.size()));
+
+      if (selected.m_map.size() < maxEntries)
+        addRecentEntries(maxEntries - selected.m_map.size());
+
+      if (selected.m_map.size() < maxEntries)
+        addRoundRobinEntries(maxEntries - selected.m_map.size());
+      break;
+    }
+
+    case SubsetStrategy::Full:
+    default:
+      addRoundRobinEntries(maxEntries);
+      break;
+  }
 
   return selected;
 }

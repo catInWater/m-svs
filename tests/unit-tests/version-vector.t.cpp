@@ -118,6 +118,86 @@ BOOST_AUTO_TEST_CASE(SelectSubsetKeepsPreferredAndRecentEntries)
   BOOST_CHECK_EQUAL(subset.get("/node/four"), 4);
 }
 
+BOOST_AUTO_TEST_CASE(SelectSubsetRoundRobinMaintainsBudget)
+{
+  VersionVector vv;
+  vv.set("/node/one", 1);
+  vv.set("/node/two", 2);
+  vv.set("/node/three", 3);
+  vv.set("/node/four", 4);
+  vv.set("/node/five", 5);
+
+  VersionVector subset = vv.selectSubset(3,
+                                         0,
+                                         2,
+                                         "/node/one",
+                                         VersionVector::SubsetStrategy::RoundRobin);
+
+  BOOST_CHECK_EQUAL(subset.size(), 3);
+  BOOST_CHECK(subset.has("/node/one"));
+}
+
+BOOST_AUTO_TEST_CASE(SelectSubsetRecentOnlyMaintainsBudget)
+{
+  VersionVector vv;
+  vv.set("/node/one", 1);
+  vv.set("/node/two", 2);
+  vv.set("/node/three", 3);
+  vv.set("/node/four", 4);
+
+  VersionVector subset = vv.selectSubset(2,
+                                         0,
+                                         0,
+                                         NodeID(),
+                                         VersionVector::SubsetStrategy::Recent);
+
+  BOOST_CHECK_EQUAL(subset.size(), 2);
+  BOOST_CHECK(subset.has("/node/four"));
+  BOOST_CHECK(subset.has("/node/three"));
+}
+
+BOOST_AUTO_TEST_CASE(SelectSubsetRandomMaintainsBudget)
+{
+  VersionVector vv;
+  vv.set("/node/one", 1);
+  vv.set("/node/two", 2);
+  vv.set("/node/three", 3);
+  vv.set("/node/four", 4);
+  vv.set("/node/five", 5);
+
+  VersionVector subset = vv.selectSubset(3,
+                                         0,
+                                         42,
+                                         "/node/two",
+                                         VersionVector::SubsetStrategy::Random);
+
+  BOOST_CHECK_EQUAL(subset.size(), 3);
+  BOOST_CHECK(subset.has("/node/two"));
+}
+
+BOOST_AUTO_TEST_CASE(SelectSubsetHybridBalancesHotAndFairCoverage)
+{
+  VersionVector vv;
+  vv.set("/node/one", 1);
+  vv.set("/node/two", 2);
+  vv.set("/node/three", 3);
+  vv.set("/node/four", 4);
+  vv.set("/node/five", 5);
+  vv.set("/node/six", 6);
+
+  VersionVector subset = vv.selectSubset(4,
+                                         1,
+                                         2,
+                                         "/node/one",
+                                         VersionVector::SubsetStrategy::Hybrid);
+
+  BOOST_CHECK_EQUAL(subset.size(), 4);
+  BOOST_CHECK(subset.has("/node/one"));
+  BOOST_CHECK(subset.has("/node/six"));
+  BOOST_CHECK(subset.has("/node/five"));
+  BOOST_CHECK(subset.has("/node/two") || subset.has("/node/three") || subset.has("/node/four"));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests

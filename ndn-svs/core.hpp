@@ -50,6 +50,21 @@ public:
  */
 using UpdateCallback = std::function<void(const std::vector<MissingDataInfo>&)>;
 
+enum class TimerMode
+{
+  Fixed,
+  Adaptive,
+  NetworkAware,
+};
+
+enum class SyncSignal
+{
+  Idle,
+  RemoteUpdate,
+  RepairNeeded,
+  LocalUpdate,
+};
+
 /**
  * @brief Pure SVS
  */
@@ -228,7 +243,7 @@ public:
 private:
   size_t getStateVectorLimit(size_t totalEntries) const;
   VersionVector buildSyncVector();
-  void updateSyncInterval(bool hasActivity);
+  void updateSyncInterval(SyncSignal signal);
   unsigned int sampleSyncDelay();
 
 private:
@@ -267,8 +282,42 @@ private:
   size_t m_recentStateVectorEntries;
   // Hard cap for the number of state vector entries per sync interest.
   size_t m_maxStateVectorEntries;
+  // Ratio of the current vector to carry in a partial Sync Interest.
+  double m_stateVectorRatio;
+  // Selection strategy used to build partial state vectors.
+  VersionVector::SubsetStrategy m_stateVectorStrategy;
+  // Fraction of the hybrid budget reserved for recent/hot entries.
+  double m_hybridHotRatio;
+  // Minimum number of rotating fairness entries kept in hybrid mode.
+  size_t m_hybridMinFairEntries;
+  // Estimated one-way network diameter in milliseconds.
+  double m_networkDiameterMs;
+  // Estimated hop diameter of the topology.
+  size_t m_networkDiameterHops;
+  // Packet loss rate in the current scenario, normalized to [0,1].
+  double m_linkLossRate;
+  // Expected fraction of hot producers in the workload.
+  double m_expectedHotspotRatio;
+  // Whether timer and partial-vector decisions should be coordinated.
+  bool m_enableCoordinatedSync;
+  // Timer mode for comparison between adaptive and fixed scheduling.
+  TimerMode m_timerMode;
+  // Whether to print per-interest metrics for offline evaluation.
+  bool m_enableMetricsLog;
   // Round-robin cursor through the state vector to guarantee coverage.
   size_t m_stateVectorCursor;
+  // Smoothed activity estimate used by the adaptive timer.
+  double m_activityScore = 0.0;
+  // Smoothed hotspot pressure estimate.
+  double m_hotspotScore = 0.0;
+  // Timestamp of the last timer adjustment to avoid overreacting.
+  long m_lastTimerAdjustUs = 0;
+  // Minimum transmit gap used to batch bursty sync notifications.
+  time::milliseconds m_minSendInterval{ 0_ms };
+  // Small batching delay for local publications.
+  time::milliseconds m_localUpdateDelay{ 1_ms };
+  // Timestamp of the last actual Sync Interest transmission.
+  std::atomic_long m_lastSyncTxUs{ 0 };
 
   // Random Engine
   ndn::random::RandomNumberEngine& m_rng;

@@ -27,6 +27,16 @@ namespace ndn::svs {
 class VersionVector
 {
 public:
+  enum class SubsetStrategy
+  {
+    Full,
+    Hybrid,
+    RoundRobin,
+    Recent,
+    Random,
+  };
+
+public:
   class Error : public std::runtime_error
   {
   public:
@@ -53,7 +63,10 @@ public:
   VersionVector selectSubset(size_t maxEntries,
                              size_t recentEntries = 0,
                              size_t startIndex = 0,
-                             const NodeID& preferredNode = NodeID()) const;
+                             const NodeID& preferredNode = NodeID(),
+                             SubsetStrategy strategy = SubsetStrategy::Hybrid,
+                             double hotRatio = 0.75,
+                             size_t minFairEntries = 2) const;
 
   /** Get a human-readable representation */
   std::string toStr() const;
