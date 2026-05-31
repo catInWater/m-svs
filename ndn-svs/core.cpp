@@ -97,6 +97,24 @@ parseSubsetStrategy(const std::string& strategy)
     return VersionVector::SubsetStrategy::Recent;
   if (value == "random")
     return VersionVector::SubsetStrategy::Random;
+  if (value == "cluster-hybrid" || value == "clusterhybrid" || value == "clustered-hybrid")
+    return VersionVector::SubsetStrategy::ClusterHybrid;
+  if (value == "sticky-recent" || value == "stickyrecent" || value == "recent-sticky")
+    return VersionVector::SubsetStrategy::StickyRecent;
+  if (value == "recent-novelty-quota" || value == "recentnoveltyquota" || value == "novelty-recent")
+    return VersionVector::SubsetStrategy::RecentNoveltyQuota;
+  if (value == "recent-random-quota" || value == "recentrandomquota" || value == "random-recent")
+    return VersionVector::SubsetStrategy::RecentRandomQuota;
+  if (value == "adaptive-recent-score" || value == "adaptiverecentscore" || value == "recent-score-adaptive")
+    return VersionVector::SubsetStrategy::AdaptiveRecentScore;
+  if (value == "cluster-score" || value == "clusterscore" || value == "clustered-score")
+    return VersionVector::SubsetStrategy::ClusterScore;
+  if (value == "age-score" || value == "agescore" || value == "stale-score")
+    return VersionVector::SubsetStrategy::AgeScore;
+  if (value == "deficit-score" || value == "deficitscore" || value == "lag-score")
+    return VersionVector::SubsetStrategy::DeficitScore;
+  if (value == "score" || value == "scored" || value == "score-based")
+    return VersionVector::SubsetStrategy::Score;
   return VersionVector::SubsetStrategy::Hybrid;
 }
 
@@ -119,12 +137,30 @@ toString(VersionVector::SubsetStrategy strategy)
   switch (strategy) {
     case VersionVector::SubsetStrategy::Full:
       return "full";
+    case VersionVector::SubsetStrategy::ClusterHybrid:
+      return "cluster-hybrid";
+    case VersionVector::SubsetStrategy::StickyRecent:
+      return "sticky-recent";
+    case VersionVector::SubsetStrategy::RecentNoveltyQuota:
+      return "recent-novelty-quota";
+    case VersionVector::SubsetStrategy::RecentRandomQuota:
+      return "recent-random-quota";
+    case VersionVector::SubsetStrategy::AdaptiveRecentScore:
+      return "adaptive-recent-score";
     case VersionVector::SubsetStrategy::RoundRobin:
       return "round-robin";
     case VersionVector::SubsetStrategy::Recent:
       return "recent";
     case VersionVector::SubsetStrategy::Random:
       return "random";
+    case VersionVector::SubsetStrategy::ClusterScore:
+      return "cluster-score";
+    case VersionVector::SubsetStrategy::AgeScore:
+      return "age-score";
+    case VersionVector::SubsetStrategy::DeficitScore:
+      return "deficit-score";
+    case VersionVector::SubsetStrategy::Score:
+      return "score";
     case VersionVector::SubsetStrategy::Hybrid:
     default:
       return "hybrid";
@@ -168,6 +204,16 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_stateVectorStrategy(parseSubsetStrategy(getEnvOrDefault("NDN_SVS_VECTOR_STRATEGY", "hybrid")))
   , m_hybridHotRatio(getEnvDouble("NDN_SVS_HYBRID_HOT_RATIO", 0.75))
   , m_hybridMinFairEntries(getEnvSize("NDN_SVS_HYBRID_MIN_FAIR_ENTRIES", 2))
+  , m_scoreSeqWeight(getEnvDouble("NDN_SVS_SCORE_SEQ_WEIGHT", 0.35))
+  , m_scoreRecentWeight(getEnvDouble("NDN_SVS_SCORE_RECENT_WEIGHT", 0.45))
+  , m_scoreFairWeight(getEnvDouble("NDN_SVS_SCORE_FAIR_WEIGHT", 0.20))
+  , m_scorePreferredBoost(getEnvDouble("NDN_SVS_SCORE_PREFERRED_BOOST", 0.60))
+  , m_stickyHoldRatio(getEnvDouble("NDN_SVS_STICKY_HOLD_RATIO", 0.50))
+  , m_stickyMinHold(getEnvSize("NDN_SVS_STICKY_MIN_HOLD", 4))
+  , m_recentQuotaRatio(getEnvDouble("NDN_SVS_RECENT_QUOTA_RATIO", 0.20))
+  , m_recentQuotaMinEntries(getEnvSize("NDN_SVS_RECENT_QUOTA_MIN_ENTRIES", 4))
+  , m_adaptiveScoreThreshold(getEnvDouble("NDN_SVS_ADAPTIVE_SCORE_THRESHOLD", 0.50))
+  , m_adaptiveScoreRounds(getEnvSize("NDN_SVS_ADAPTIVE_SCORE_ROUNDS", 2))
   , m_networkDiameterMs(getEnvDouble("NDN_SVS_NETWORK_DIAMETER_MS", 120.0))
   , m_networkDiameterHops(getEnvSize("NDN_SVS_NETWORK_DIAMETER_HOPS", 4))
   , m_linkLossRate(std::clamp(getEnvDouble("NDN_SVS_LINK_LOSS_PCT", 0.0) / 100.0, 0.0, 0.95))
@@ -214,6 +260,16 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
               << " max_entries=" << m_maxStateVectorEntries
               << " hybrid_hot_ratio=" << m_hybridHotRatio
               << " hybrid_min_fair=" << m_hybridMinFairEntries
+              << " score_seq_weight=" << m_scoreSeqWeight
+              << " score_recent_weight=" << m_scoreRecentWeight
+              << " score_fair_weight=" << m_scoreFairWeight
+              << " score_preferred_boost=" << m_scorePreferredBoost
+              << " sticky_hold_ratio=" << m_stickyHoldRatio
+              << " sticky_min_hold=" << m_stickyMinHold
+              << " recent_quota_ratio=" << m_recentQuotaRatio
+              << " recent_quota_min_entries=" << m_recentQuotaMinEntries
+              << " adaptive_score_threshold=" << m_adaptiveScoreThreshold
+              << " adaptive_score_rounds=" << m_adaptiveScoreRounds
               << " diameter_ms=" << m_networkDiameterMs
               << " diameter_hops=" << m_networkDiameterHops
               << " loss_rate=" << m_linkLossRate
@@ -310,29 +366,136 @@ SVSyncCore::buildSyncVector()
   if (m_stateVectorStrategy == VersionVector::SubsetStrategy::Random)
     selector = static_cast<size_t>(m_rng());
 
+  VersionVector::SubsetStrategy effectiveStrategy = m_stateVectorStrategy;
+
   double effectiveHotRatio = m_hybridHotRatio;
   size_t effectiveFairEntries = m_hybridMinFairEntries;
-  if (m_enableCoordinatedSync && m_stateVectorStrategy == VersionVector::SubsetStrategy::Hybrid) {
+  double effectiveScoreSeqWeight = m_scoreSeqWeight;
+  double effectiveScoreRecentWeight = m_scoreRecentWeight;
+  double effectiveScoreFairWeight = m_scoreFairWeight;
+  double effectiveScorePreferredBoost = m_scorePreferredBoost;
+
+  const double coveragePressure = totalEntries > 0
+                                    ? 1.0 - std::min(1.0, static_cast<double>(limit) / static_cast<double>(totalEntries))
+                                    : 0.0;
+  const double recencyStress = 1.0 - std::clamp(m_hotspotScore, 0.0, 1.0);
+  const double repairPressure = std::clamp(0.55 * coveragePressure + 0.25 * m_linkLossRate + 0.20 * recencyStress,
+                                           0.0,
+                                           1.0);
+
+  if (m_stateVectorStrategy == VersionVector::SubsetStrategy::AdaptiveRecentScore) {
+    if (m_adaptiveScoreBurstRemaining > 0) {
+      effectiveStrategy = VersionVector::SubsetStrategy::Score;
+      --m_adaptiveScoreBurstRemaining;
+    }
+    else if (repairPressure >= std::clamp(m_adaptiveScoreThreshold, 0.0, 1.0)) {
+      effectiveStrategy = VersionVector::SubsetStrategy::Score;
+      m_adaptiveScoreBurstRemaining = m_adaptiveScoreRounds > 0 ? m_adaptiveScoreRounds - 1 : 0;
+    }
+    else {
+      effectiveStrategy = VersionVector::SubsetStrategy::Recent;
+    }
+  }
+
+  if (m_enableCoordinatedSync) {
     const double topologyPressure = std::min(1.0, m_networkDiameterMs / 250.0);
     const double hotness = std::clamp(0.6 * m_hotspotScore + 0.25 * m_activityScore + 0.15 * m_expectedHotspotRatio,
                                       0.0,
                                       1.0);
-    effectiveHotRatio = std::clamp(m_hybridHotRatio + 0.12 * hotness + 0.08 * m_linkLossRate - 0.03 * topologyPressure,
-                                   0.55,
-                                   0.92);
-    if (hotness < 0.35)
-      effectiveFairEntries = std::min<size_t>(std::max<size_t>(1, m_hybridMinFairEntries + 1), std::max<size_t>(1, limit / 3));
+
+    if (effectiveStrategy == VersionVector::SubsetStrategy::Hybrid ||
+      effectiveStrategy == VersionVector::SubsetStrategy::ClusterHybrid) {
+      effectiveHotRatio = std::clamp(m_hybridHotRatio + 0.12 * hotness + 0.08 * m_linkLossRate - 0.03 * topologyPressure,
+                                     0.55,
+                                     0.92);
+      if (hotness < 0.35) {
+        effectiveFairEntries = std::min<size_t>(std::max<size_t>(1, m_hybridMinFairEntries + 1),
+                                                std::max<size_t>(1, limit / 3));
+      }
+    }
+    else if (effectiveStrategy == VersionVector::SubsetStrategy::Score ||
+         effectiveStrategy == VersionVector::SubsetStrategy::ClusterScore ||
+         effectiveStrategy == VersionVector::SubsetStrategy::AgeScore ||
+         effectiveStrategy == VersionVector::SubsetStrategy::DeficitScore) {
+      effectiveScoreSeqWeight = std::clamp(m_scoreSeqWeight + 0.10 * hotness, 0.10, 0.70);
+      effectiveScoreRecentWeight = std::clamp(m_scoreRecentWeight + 0.08 * m_linkLossRate + 0.05 * topologyPressure,
+                                              0.15,
+                                              0.75);
+      effectiveScoreFairWeight = std::clamp(m_scoreFairWeight + (hotness < 0.35 ? 0.10 : 0.03), 0.10, 0.50);
+      effectiveScorePreferredBoost = std::clamp(m_scorePreferredBoost + 0.15 * hotness, 0.20, 1.20);
+      if (hotness < 0.35) {
+        effectiveFairEntries = std::min<size_t>(std::max<size_t>(1, m_hybridMinFairEntries + 1),
+                                                std::max<size_t>(1, limit / 3));
+      }
+    }
+  }
+
+  std::vector<NodeID> stickyNodes;
+  size_t stickyBudget = 0;
+  if (m_stateVectorStrategy == VersionVector::SubsetStrategy::StickyRecent && !m_lastSelectedNodes.empty() && limit > 1) {
+    stickyNodes = m_lastSelectedNodes;
+    stickyBudget = std::min(limit - 1,
+                            std::max(std::min(m_stickyMinHold, limit - 1),
+                                     static_cast<size_t>(std::ceil(static_cast<double>(limit) * std::clamp(m_stickyHoldRatio,
+                                                                                                              0.0,
+                                                                                                              1.0)))));
+  }
+
+  std::vector<NodeID> noveltyBaseNodes;
+  size_t noveltyBudget = 0;
+  if ((m_stateVectorStrategy == VersionVector::SubsetStrategy::RecentNoveltyQuota ||
+       m_stateVectorStrategy == VersionVector::SubsetStrategy::RecentRandomQuota) &&
+      limit > 1) {
+    noveltyBaseNodes = m_lastSelectedNodes;
+    noveltyBudget = std::min(limit - 1,
+                             std::max(std::min(m_recentQuotaMinEntries, limit - 1),
+                                      static_cast<size_t>(std::ceil(static_cast<double>(limit) * std::clamp(m_recentQuotaRatio,
+                                                                                                               0.0,
+                                                                                                               1.0)))));
   }
 
   VersionVector partial = m_vv.selectSubset(limit,
                                             m_recentStateVectorEntries,
                                             selector,
                                             m_id,
-                                            m_stateVectorStrategy,
+                                            effectiveStrategy,
                                             effectiveHotRatio,
-                                            effectiveFairEntries);
-  if (totalEntries > 0 && m_stateVectorStrategy != VersionVector::SubsetStrategy::Random)
+                                            effectiveFairEntries,
+                                            effectiveScoreSeqWeight,
+                                            effectiveScoreRecentWeight,
+                                            effectiveScoreFairWeight,
+                                            effectiveScorePreferredBoost,
+                                            stickyNodes,
+                                            stickyBudget,
+                                            noveltyBaseNodes,
+                                            noveltyBudget);
+
+  if (totalEntries > 0 && effectiveStrategy != VersionVector::SubsetStrategy::Random)
     m_stateVectorCursor = (m_stateVectorCursor + limit) % totalEntries;
+
+  m_lastSelectedNodes.clear();
+  std::vector<std::pair<NodeID, time::system_clock::time_point>> selectedNodes;
+  selectedNodes.reserve(partial.size());
+  for (const auto& [nid, seqNo] : partial) {
+    selectedNodes.push_back({ nid, partial.getLastUpdate(nid) });
+  }
+  std::sort(selectedNodes.begin(), selectedNodes.end(), [](const auto& lhs, const auto& rhs) {
+    if (lhs.second != rhs.second)
+      return lhs.second > rhs.second;
+    return lhs.first < rhs.first;
+  });
+  for (const auto& [nid, ts] : selectedNodes)
+    m_lastSelectedNodes.push_back(nid);
+
+  if (m_enableMetricsLog && effectiveStrategy != m_stateVectorStrategy) {
+    std::cout << "SVS_STRATEGY_SWITCH node=" << m_id
+              << " configured=" << toString(m_stateVectorStrategy)
+              << " effective=" << toString(effectiveStrategy)
+              << " repair_pressure=" << repairPressure
+              << " coverage_pressure=" << coveragePressure
+              << std::endl;
+  }
+
   return partial;
 }
 

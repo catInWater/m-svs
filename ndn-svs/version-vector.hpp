@@ -31,6 +31,15 @@ public:
   {
     Full,
     Hybrid,
+    ClusterHybrid,
+    StickyRecent,
+    RecentNoveltyQuota,
+    RecentRandomQuota,
+    AdaptiveRecentScore,
+    Score,
+    ClusterScore,
+    AgeScore,
+    DeficitScore,
     RoundRobin,
     Recent,
     Random,
@@ -66,7 +75,15 @@ public:
                              const NodeID& preferredNode = NodeID(),
                              SubsetStrategy strategy = SubsetStrategy::Hybrid,
                              double hotRatio = 0.75,
-                             size_t minFairEntries = 2) const;
+                             size_t minFairEntries = 2,
+                             double scoreSeqWeight = 0.35,
+                             double scoreRecentWeight = 0.45,
+                             double scoreFairWeight = 0.20,
+                             double scorePreferredBoost = 0.60,
+                             const std::vector<NodeID>& stickyEntries = {},
+                             size_t stickyBudget = 0,
+                             const std::vector<NodeID>& noveltyBaseEntries = {},
+                             size_t noveltyBudget = 0) const;
 
   /** Get a human-readable representation */
   std::string toStr() const;

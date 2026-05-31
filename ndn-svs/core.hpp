@@ -290,6 +290,23 @@ private:
   double m_hybridHotRatio;
   // Minimum number of rotating fairness entries kept in hybrid mode.
   size_t m_hybridMinFairEntries;
+  // Tunable weights for the score-based state-vector selector.
+  double m_scoreSeqWeight;
+  double m_scoreRecentWeight;
+  double m_scoreFairWeight;
+  double m_scorePreferredBoost;
+  // Fraction of the previous recent subset to retain in sticky mode.
+  double m_stickyHoldRatio;
+  // Minimum number of previous entries to keep when sticky mode is enabled.
+  size_t m_stickyMinHold;
+  // Fraction of the state-vector budget reserved for the recent+quota family.
+  double m_recentQuotaRatio;
+  // Minimum quota slots reserved for novelty/random quota selectors.
+  size_t m_recentQuotaMinEntries;
+  // Trigger threshold for switching adaptive recent/score into score mode.
+  double m_adaptiveScoreThreshold;
+  // Number of consecutive score rounds to keep once adaptive mode triggers.
+  size_t m_adaptiveScoreRounds;
   // Estimated one-way network diameter in milliseconds.
   double m_networkDiameterMs;
   // Estimated hop diameter of the topology.
@@ -310,6 +327,10 @@ private:
   double m_activityScore = 0.0;
   // Smoothed hotspot pressure estimate.
   double m_hotspotScore = 0.0;
+  // Remaining forced score rounds for the adaptive recent/score strategy.
+  size_t m_adaptiveScoreBurstRemaining = 0;
+  // Most recent partial selection, used by sticky recent mode.
+  std::vector<NodeID> m_lastSelectedNodes;
   // Timestamp of the last timer adjustment to avoid overreacting.
   long m_lastTimerAdjustUs = 0;
   // Minimum transmit gap used to batch bursty sync notifications.
