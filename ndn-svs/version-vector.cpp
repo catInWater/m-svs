@@ -115,7 +115,8 @@ VersionVector::selectSubset(size_t maxEntries,
                             const std::vector<NodeID>& stickyEntries,
                             size_t stickyBudget,
                             const std::vector<NodeID>& noveltyBaseEntries,
-                            size_t noveltyBudget) const
+                            size_t noveltyBudget,
+                            const std::map<NodeID, size_t>& scoreCompensationRounds) const
 {
   VersionVector selected;
 
@@ -269,6 +270,14 @@ VersionVector::selectSubset(size_t maxEntries,
     for (const auto& [nid, seqNo] : m_map)
       maxSeq = std::max(maxSeq, seqNo);
 
+    size_t maxCompensationRounds = 0;
+    for (const auto& nid : orderedNodes) {
+      auto compensationIt = scoreCompensationRounds.find(nid);
+      if (compensationIt != scoreCompensationRounds.end())
+        maxCompensationRounds = std::max(maxCompensationRounds, compensationIt->second);
+    }
+    constexpr double compensationEpsilon = 1e-9;
+
     struct Candidate
     {
       NodeID nid;
@@ -278,7 +287,6 @@ VersionVector::selectSubset(size_t maxEntries,
 
     std::vector<Candidate> candidates;
     candidates.reserve(orderedNodes.size());
-    size_t offsetBase = startIndex % orderedNodes.size();
     for (size_t i = 0; i < orderedNodes.size(); ++i) {
       const auto& nid = orderedNodes[i];
       if (selected.m_map.find(nid) != selected.m_map.end())
@@ -293,12 +301,13 @@ VersionVector::selectSubset(size_t maxEntries,
                                    ? 1.0
                                    : 1.0 - static_cast<double>(rank) / static_cast<double>(recentNodes.size() - 1);
 
-      const size_t rrOffset = (i + orderedNodes.size() - offsetBase) % orderedNodes.size();
-      const double fairScore = orderedNodes.size() <= 1
-                                 ? 1.0
-                                 : 1.0 - static_cast<double>(rrOffset) / static_cast<double>(orderedNodes.size() - 1);
+      auto compensationIt = scoreCompensationRounds.find(nid);
+      const double compensationScore = compensationIt == scoreCompensationRounds.end()
+                                         ? 0.0
+                                         : static_cast<double>(compensationIt->second) /
+                                             (static_cast<double>(maxCompensationRounds) + compensationEpsilon);
 
-      double score = seqWeight * seqScore + recentWeight * recentScore + fairWeight * fairScore;
+      double score = seqWeight * seqScore + recentWeight * recentScore + fairWeight * compensationScore;
       if (!preferredNode.empty() && nid == preferredNode)
         score += std::max(0.0, scorePreferredBoost);
 
@@ -622,24 +631,7 @@ VersionVector::selectSubset(size_t maxEntries,
       break;
 
     case SubsetStrategy::Score: {
-      const size_t fairnessReserve = maxEntries >= 4
-                                       ? std::min(maxEntries - 1, std::max<size_t>(1, minFairEntries))
-                                       : 0;
-      const size_t scoredBudget = maxEntries > selected.m_map.size() + fairnessReserve
-                                    ? maxEntries - selected.m_map.size() - fairnessReserve
-                                    : maxEntries - selected.m_map.size();
-
-      if (scoredBudget > 0)
-        addScoreEntries(scoredBudget);
-
-      if (fairnessReserve > 0 && selected.m_map.size() < maxEntries)
-        addRoundRobinEntries(std::min(fairnessReserve, maxEntries - selected.m_map.size()));
-
-      if (selected.m_map.size() < maxEntries)
-        addScoreEntries(maxEntries - selected.m_map.size());
-
-      if (selected.m_map.size() < maxEntries)
-        addRoundRobinEntries(maxEntries - selected.m_map.size());
+      addScoreEntries(maxEntries - selected.m_map.size());
       break;
     }
 

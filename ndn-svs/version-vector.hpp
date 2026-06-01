@@ -83,7 +83,8 @@ public:
                              const std::vector<NodeID>& stickyEntries = {},
                              size_t stickyBudget = 0,
                              const std::vector<NodeID>& noveltyBaseEntries = {},
-                             size_t noveltyBudget = 0) const;
+                             size_t noveltyBudget = 0,
+                             const std::map<NodeID, size_t>& scoreCompensationRounds = {}) const;
 
   /** Get a human-readable representation */
   std::string toStr() const;

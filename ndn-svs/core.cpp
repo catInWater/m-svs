@@ -181,6 +181,18 @@ toString(TimerMode mode)
   }
 }
 
+double
+timerHotness(double hotspotScore, double activityScore)
+{
+  return std::clamp(0.65 * hotspotScore + 0.35 * activityScore, 0.0, 1.0);
+}
+
+double
+feedbackPressure(double delayMs, double jitterMs)
+{
+  return std::clamp((std::max(0.0, delayMs) + 1.5 * std::max(0.0, jitterMs)) / 900.0, 0.0, 1.0);
+}
+
 } // namespace
 
 SVSyncCore::SVSyncCore(ndn::Face& face,
@@ -216,9 +228,11 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_adaptiveScoreRounds(getEnvSize("NDN_SVS_ADAPTIVE_SCORE_ROUNDS", 2))
   , m_networkDiameterMs(getEnvDouble("NDN_SVS_NETWORK_DIAMETER_MS", 120.0))
   , m_networkDiameterHops(getEnvSize("NDN_SVS_NETWORK_DIAMETER_HOPS", 4))
+  , m_networkAwareMinPeriodicSyncTime(time::milliseconds(getEnvSize("NDN_SVS_NETWORK_AWARE_MIN_INTERVAL_MS", 4000)))
   , m_linkLossRate(std::clamp(getEnvDouble("NDN_SVS_LINK_LOSS_PCT", 0.0) / 100.0, 0.0, 0.95))
   , m_expectedHotspotRatio(std::clamp(getEnvDouble("NDN_SVS_HOT_NODE_RATIO", 0.0), 0.0, 1.0))
   , m_enableCoordinatedSync(getEnvBool("NDN_SVS_COORDINATED_SYNC", true))
+  , m_enableEventDrivenTimerAlpha(getEnvBool("NDN_SVS_NETWORK_AWARE_EVENT_ALPHA", true))
   , m_timerMode(parseTimerMode(getEnvOrDefault("NDN_SVS_TIMER_MODE", "network-aware")))
   , m_enableMetricsLog(getEnvBool("NDN_SVS_LOG_METRICS", false))
   , m_stateVectorCursor(0)
@@ -230,21 +244,13 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_scheduler(m_face.getIoContext())
 {
   if (m_timerMode == TimerMode::NetworkAware) {
-    const double diameterMs = std::max(20.0, m_networkDiameterMs);
-    auto suppressionMs = static_cast<long>(std::llround(diameterMs * (1.2 + 1.6 * m_linkLossRate)
-                                                        + static_cast<double>(m_networkDiameterHops) * 8.0));
-    suppressionMs = std::clamp<long>(suppressionMs, 40, 1200);
-    m_maxSuppressionTime = time::milliseconds(suppressionMs);
-    m_intrReplyDist = std::uniform_int_distribution<>(0, m_maxSuppressionTime.count());
-
-    auto awareMin = static_cast<long>(std::llround(diameterMs * (3.5 + 2.5 * m_linkLossRate)
-                                                   + static_cast<double>(m_networkDiameterHops) * 30.0));
-    awareMin = std::clamp<long>(awareMin, 300, 5000);
-    m_minPeriodicSyncTime = time::milliseconds(awareMin);
-    auto initialPeriod = std::clamp<long>(static_cast<long>(std::llround(awareMin * (2.0 + 0.8 * m_linkLossRate))),
-                                          awareMin,
-                                          m_maxPeriodicSyncTime.count());
-    m_periodicSyncTime = time::milliseconds(std::min<long>(m_periodicSyncTime.count(), initialPeriod));
+    m_feedbackDelayMs = std::clamp(m_networkDiameterMs * (1.3 + 1.4 * m_linkLossRate)
+                                     + static_cast<double>(m_networkDiameterHops) * 12.0
+                                     + 60.0,
+                                   40.0,
+                                   1800.0);
+    m_feedbackJitterMs = std::max(20.0, m_feedbackDelayMs * (0.18 + 0.25 * m_linkLossRate));
+    refreshNetworkAwareTimerState(true);
   }
 
   if (m_periodicSyncTime < m_minPeriodicSyncTime)
@@ -274,6 +280,8 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
               << " diameter_hops=" << m_networkDiameterHops
               << " loss_rate=" << m_linkLossRate
               << " hot_ratio=" << m_expectedHotspotRatio
+              << " feedback_delay_ms=" << m_feedbackDelayMs
+              << " feedback_jitter_ms=" << m_feedbackJitterMs
               << " coordinated=" << (m_enableCoordinatedSync ? 1 : 0)
               << " min_gap_ms=" << m_minSendInterval.count()
               << " local_batch_ms=" << m_localUpdateDelay.count()
@@ -359,8 +367,12 @@ SVSyncCore::buildSyncVector()
 
   const size_t totalEntries = m_vv.size();
   const size_t limit = getStateVectorLimit(totalEntries);
-  if (limit >= totalEntries || m_stateVectorStrategy == VersionVector::SubsetStrategy::Full)
+  if (limit >= totalEntries || m_stateVectorStrategy == VersionVector::SubsetStrategy::Full) {
+    m_scoreUnselectedRounds.clear();
+    for (const auto& [nid, seqNo] : m_vv)
+      m_scoreUnselectedRounds[nid] = 0;
     return m_vv;
+  }
 
   size_t selector = m_stateVectorCursor;
   if (m_stateVectorStrategy == VersionVector::SubsetStrategy::Random)
@@ -454,6 +466,13 @@ SVSyncCore::buildSyncVector()
                                                                                                                1.0)))));
   }
 
+    for (auto it = m_scoreUnselectedRounds.begin(); it != m_scoreUnselectedRounds.end();) {
+      if (!m_vv.has(it->first))
+        it = m_scoreUnselectedRounds.erase(it);
+      else
+        ++it;
+    }
+
   VersionVector partial = m_vv.selectSubset(limit,
                                             m_recentStateVectorEntries,
                                             selector,
@@ -468,7 +487,8 @@ SVSyncCore::buildSyncVector()
                                             stickyNodes,
                                             stickyBudget,
                                             noveltyBaseNodes,
-                                            noveltyBudget);
+                                            noveltyBudget,
+                                            m_scoreUnselectedRounds);
 
   if (totalEntries > 0 && effectiveStrategy != VersionVector::SubsetStrategy::Random)
     m_stateVectorCursor = (m_stateVectorCursor + limit) % totalEntries;
@@ -484,8 +504,19 @@ SVSyncCore::buildSyncVector()
       return lhs.second > rhs.second;
     return lhs.first < rhs.first;
   });
+  std::set<NodeID> selectedNow;
   for (const auto& [nid, ts] : selectedNodes)
     m_lastSelectedNodes.push_back(nid);
+  for (const auto& [nid, ts] : selectedNodes)
+    selectedNow.insert(nid);
+
+  for (const auto& [nid, seqNo] : m_vv) {
+    size_t& missedRounds = m_scoreUnselectedRounds[nid];
+    if (selectedNow.find(nid) != selectedNow.end())
+      missedRounds = 0;
+    else
+      ++missedRounds;
+  }
 
   if (m_enableMetricsLog && effectiveStrategy != m_stateVectorStrategy) {
     std::cout << "SVS_STRATEGY_SWITCH node=" << m_id
@@ -561,62 +592,38 @@ SVSyncCore::updateSyncInterval(SyncSignal signal)
     return;
   }
 
-  const double topologyPressure = std::min(1.0, m_networkDiameterMs / 250.0);
-  const double coordinationGain = (m_enableCoordinatedSync && m_stateVectorStrategy != VersionVector::SubsetStrategy::Full)
-                                    ? 0.88
-                                    : 1.0;
-  const long networkFloor = std::max<long>(
+  const long feedbackTarget = std::clamp<long>(
+    static_cast<long>(std::llround(3.0 * std::max(40.0, m_feedbackDelayMs)
+                                   + 2.2 * std::max(15.0, m_feedbackJitterMs)
+                                   + 320.0
+                                   + 220.0 * m_linkLossRate)),
     floorMs,
-    static_cast<long>(std::llround((m_networkDiameterMs * (3.0 + 2.2 * m_linkLossRate)
-                                    + static_cast<double>(m_networkDiameterHops) * 24.0
-                                    + 180.0)
-                                   * coordinationGain)));
+    m_maxPeriodicSyncTime.count());
 
-  long next = current;
-  switch (signal) {
-    case SyncSignal::LocalUpdate:
-      m_activityScore = std::min(1.0, m_activityScore * 0.72 + 0.25);
-      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.65 + 0.35);
-      {
-        const double hotnessNow = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
-                                             0.0,
-                                             1.0);
-        const long divisor = (m_enableCoordinatedSync && m_stateVectorStrategy != VersionVector::SubsetStrategy::Full)
-                               ? (hotnessNow > 0.72 ? 4 : 5)
-                               : (hotnessNow > 0.72 ? 6 : 7);
-        next = std::max<long>(networkFloor,
-                              current - std::max<long>(120, current / divisor));
-      }
-      break;
-
-    case SyncSignal::RepairNeeded:
-      m_activityScore = std::min(1.0, m_activityScore * 0.75 + 0.22);
-      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.82 + 0.12);
-      next = std::max<long>(networkFloor, current - std::max<long>(220, current / 4));
-      break;
-
-    case SyncSignal::RemoteUpdate:
-      m_activityScore = std::min(1.0, m_activityScore * 0.80 + 0.06);
-      m_hotspotScore = std::min(1.0, m_hotspotScore * 0.90 + 0.03);
-      next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(130, current / 10));
-      break;
-
-    case SyncSignal::Idle:
-    default:
-      m_activityScore *= 0.60;
-      m_hotspotScore *= 0.55;
-      next = std::min<long>(m_maxPeriodicSyncTime.count(), current + std::max<long>(420, current / 3));
-      break;
+  double alpha = 0.06;
+  if (m_enableEventDrivenTimerAlpha) {
+    switch (signal) {
+      case SyncSignal::RepairNeeded:
+        alpha = 0.16;
+        break;
+      case SyncSignal::LocalUpdate:
+        alpha = 0.10;
+        break;
+      case SyncSignal::RemoteUpdate:
+        alpha = 0.07;
+        break;
+      case SyncSignal::Idle:
+      default:
+        alpha = 0.04;
+        break;
+    }
   }
 
-  const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
-                                    0.0,
-                                    1.0);
-  const long hotFloor = static_cast<long>(std::llround(networkFloor * (1.0 - 0.22 * hotness * (1.05 - coordinationGain))));
-  const long lossBuffer = static_cast<long>(std::llround(120.0 * m_linkLossRate + 80.0 * topologyPressure));
-
-  next = std::max<long>(std::max<long>(m_minPeriodicSyncTime.count(), hotFloor), next);
-  next = std::min<long>(m_maxPeriodicSyncTime.count(), next + lossBuffer / 4);
+  const long next = std::clamp<long>(
+    static_cast<long>(std::llround((1.0 - alpha) * static_cast<double>(current)
+                                   + alpha * static_cast<double>(feedbackTarget))),
+    floorMs,
+    m_maxPeriodicSyncTime.count());
 
   m_periodicSyncTime = time::milliseconds(next);
 }
@@ -627,7 +634,8 @@ SVSyncCore::sampleSyncDelay()
   auto base = std::max<long>(1, m_periodicSyncTime.count());
   double extraSpread = 0.0;
   if (m_timerMode == TimerMode::NetworkAware) {
-    extraSpread = 0.10 * m_linkLossRate + 0.08 * m_hotspotScore + 0.05 * std::min(1.0, m_networkDiameterMs / 250.0);
+    extraSpread = 0.05 * m_linkLossRate
+                + 0.08 * feedbackPressure(m_feedbackDelayMs, m_feedbackJitterMs);
   }
 
   auto low = std::max<long>(1, static_cast<long>(std::llround(base * (1.0 - m_periodicSyncJitter))));
@@ -719,6 +727,8 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
     return;
   }
 
+  observePropagationFeedback(*vvOther);
+
   // Read extra mapping blocks
   if (m_recvExtraBlock) {
     try {
@@ -774,9 +784,7 @@ SVSyncCore::retxSyncInterest(bool send, unsigned int delay)
 {
   if (send) {
     long minGapUs = m_minSendInterval.count() * 1000;
-    const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
-                                      0.0,
-                                      1.0);
+    const double hotness = timerHotness(m_hotspotScore, m_activityScore);
     if (minGapUs > 0 && m_enableCoordinatedSync && hotness > 0.72)
       minGapUs = std::max<long>(8000, minGapUs / 2);
 
@@ -853,7 +861,7 @@ SVSyncCore::sendSyncInterest()
               << " strategy=" << toString(m_stateVectorStrategy)
               << " timer=" << toString(m_timerMode)
               << " period_ms=" << m_periodicSyncTime.count()
-              << " hot_score=" << (0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio)
+              << " hot_score=" << timerHotness(m_hotspotScore, m_activityScore)
               << " entries=" << syncVv.size()
               << " bytes=" << wire.size()
               << std::endl;
@@ -877,7 +885,9 @@ SVSyncCore::sendSyncInterest()
       break;
   }
 
-  m_lastSyncTxUs = getCurrentTime();
+  const long sendTimeUs = getCurrentTime();
+  m_lastSyncTxUs = sendTimeUs;
+  recordPropagationFeedbackSend(syncVv.get(m_id), sendTimeUs);
   m_face.expressInterest(interest, nullptr, nullptr, nullptr);
 }
 
@@ -950,12 +960,109 @@ SVSyncCore::updateSeqNo(const SeqNo& seq, const NodeID& nid)
   if (seq > prev) {
     updateSyncInterval(SyncSignal::LocalUpdate);
     long localDelay = std::max<long>(1, m_localUpdateDelay.count());
-    const double hotness = std::clamp(0.55 * m_hotspotScore + 0.25 * m_activityScore + 0.20 * m_expectedHotspotRatio,
-                                      0.0,
-                                      1.0);
+    const double hotness = timerHotness(m_hotspotScore, m_activityScore);
     if (m_enableCoordinatedSync && hotness > 0.72)
       localDelay = std::max<long>(1, localDelay / 2);
     retxSyncInterest(false, static_cast<unsigned int>(localDelay));
+  }
+}
+
+void
+SVSyncCore::recordPropagationFeedbackSend(SeqNo localSeq, long sendTimeUs)
+{
+  if (m_timerMode != TimerMode::NetworkAware || localSeq == 0)
+    return;
+
+  std::lock_guard<std::mutex> lock(m_feedbackMutex);
+  if (!m_pendingFeedbackSeqs.empty() && m_pendingFeedbackSeqs.back().first >= localSeq)
+    return;
+
+  m_pendingFeedbackSeqs.push_back({ localSeq, sendTimeUs });
+  while (m_pendingFeedbackSeqs.size() > 32)
+    m_pendingFeedbackSeqs.pop_front();
+}
+
+void
+SVSyncCore::observePropagationFeedback(const VersionVector& vvOther)
+{
+  if (m_timerMode != TimerMode::NetworkAware)
+    return;
+
+  const SeqNo echoedSeq = vvOther.get(m_id);
+  if (echoedSeq == 0)
+    return;
+
+  const long nowUs = getCurrentTime();
+  double observedDelayMs = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(m_feedbackMutex);
+    long observedSendUs = 0;
+    while (!m_pendingFeedbackSeqs.empty() && m_pendingFeedbackSeqs.front().first <= echoedSeq) {
+      observedSendUs = m_pendingFeedbackSeqs.front().second;
+      m_pendingFeedbackSeqs.pop_front();
+    }
+
+    if (observedSendUs == 0 || nowUs <= observedSendUs)
+      return;
+
+    observedDelayMs = std::max(1.0, static_cast<double>(nowUs - observedSendUs) / 1000.0);
+    const double previousDelayMs = std::max(1.0, m_feedbackDelayMs);
+    const double alpha = m_feedbackSamples == 0 ? 1.0 : 0.18;
+    const double beta = m_feedbackSamples == 0 ? 1.0 : 0.22;
+
+    if (m_feedbackSamples == 0) {
+      m_feedbackDelayMs = observedDelayMs;
+      m_feedbackJitterMs = std::max(15.0, observedDelayMs * 0.15);
+    }
+    else {
+      m_feedbackDelayMs = (1.0 - alpha) * m_feedbackDelayMs + alpha * observedDelayMs;
+      m_feedbackJitterMs = std::max(10.0,
+                                    (1.0 - beta) * m_feedbackJitterMs
+                                      + beta * std::fabs(observedDelayMs - previousDelayMs));
+    }
+    ++m_feedbackSamples;
+  }
+
+  refreshNetworkAwareTimerState(true);
+
+  if (m_enableMetricsLog) {
+    std::cout << "SVS_FEEDBACK_METRIC ts=" << nowUs
+              << " node=" << m_id
+              << " echo_delay_ms=" << observedDelayMs
+              << " delay_ewma_ms=" << m_feedbackDelayMs
+              << " jitter_ewma_ms=" << m_feedbackJitterMs
+              << " samples=" << m_feedbackSamples
+              << std::endl;
+  }
+}
+
+void
+SVSyncCore::refreshNetworkAwareTimerState(bool clampCurrentPeriod)
+{
+  if (m_timerMode != TimerMode::NetworkAware)
+    return;
+
+  const double delayMs = std::max(40.0, m_feedbackDelayMs);
+  const double jitterMs = std::max(15.0, m_feedbackJitterMs);
+  const long suppressionMs = std::clamp<long>(static_cast<long>(std::llround(delayMs + 1.4 * jitterMs + 60.0 * m_linkLossRate)),
+                                              40,
+                                              1200);
+  const long awareMin = std::clamp<long>(static_cast<long>(std::llround(2.2 * delayMs
+                                                                        + 1.8 * jitterMs
+                                                                        + 160.0
+                                                                        + 120.0 * m_linkLossRate)),
+                                         m_networkAwareMinPeriodicSyncTime.count(),
+                                         5000);
+
+  m_maxSuppressionTime = time::milliseconds(suppressionMs);
+  m_intrReplyDist = std::uniform_int_distribution<>(0, m_maxSuppressionTime.count());
+  m_minPeriodicSyncTime = time::milliseconds(awareMin);
+
+  if (clampCurrentPeriod) {
+    if (m_periodicSyncTime < m_minPeriodicSyncTime)
+      m_periodicSyncTime = m_minPeriodicSyncTime;
+    if (m_periodicSyncTime > m_maxPeriodicSyncTime)
+      m_periodicSyncTime = m_maxPeriodicSyncTime;
   }
 }
 

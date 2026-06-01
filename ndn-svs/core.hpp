@@ -25,6 +25,7 @@
 #include <ndn-cxx/util/scheduler.hpp>
 
 #include <atomic>
+#include <deque>
 #include <mutex>
 
 namespace ndn::svs {
@@ -245,6 +246,9 @@ private:
   VersionVector buildSyncVector();
   void updateSyncInterval(SyncSignal signal);
   unsigned int sampleSyncDelay();
+  void recordPropagationFeedbackSend(SeqNo localSeq, long sendTimeUs);
+  void observePropagationFeedback(const VersionVector& vvOther);
+  void refreshNetworkAwareTimerState(bool clampCurrentPeriod);
 
 private:
   // Communication
@@ -311,12 +315,16 @@ private:
   double m_networkDiameterMs;
   // Estimated hop diameter of the topology.
   size_t m_networkDiameterHops;
+  // Minimum allowed periodic sync interval when network-aware timer mode is enabled.
+  time::milliseconds m_networkAwareMinPeriodicSyncTime{ 4_s };
   // Packet loss rate in the current scenario, normalized to [0,1].
   double m_linkLossRate;
   // Expected fraction of hot producers in the workload.
   double m_expectedHotspotRatio;
   // Whether timer and partial-vector decisions should be coordinated.
   bool m_enableCoordinatedSync;
+  // Whether network-aware timer updates should vary by local/remote/repair signals.
+  bool m_enableEventDrivenTimerAlpha;
   // Timer mode for comparison between adaptive and fixed scheduling.
   TimerMode m_timerMode;
   // Whether to print per-interest metrics for offline evaluation.
@@ -327,10 +335,21 @@ private:
   double m_activityScore = 0.0;
   // Smoothed hotspot pressure estimate.
   double m_hotspotScore = 0.0;
+  // Online estimate of echoed propagation delay in milliseconds.
+  double m_feedbackDelayMs = 0.0;
+  // Online estimate of propagation jitter in milliseconds.
+  double m_feedbackJitterMs = 0.0;
+  // Number of propagation feedback samples incorporated so far.
+  size_t m_feedbackSamples = 0;
+  // Outstanding locally published sequence numbers waiting for echoed confirmation.
+  std::deque<std::pair<SeqNo, long>> m_pendingFeedbackSeqs;
+  mutable std::mutex m_feedbackMutex;
   // Remaining forced score rounds for the adaptive recent/score strategy.
   size_t m_adaptiveScoreBurstRemaining = 0;
   // Most recent partial selection, used by sticky recent mode.
   std::vector<NodeID> m_lastSelectedNodes;
+  // Consecutive rounds each entry has gone unselected, used by Score compensation.
+  std::map<NodeID, size_t> m_scoreUnselectedRounds;
   // Timestamp of the last timer adjustment to avoid overreacting.
   long m_lastTimerAdjustUs = 0;
   // Minimum transmit gap used to batch bursty sync notifications.
